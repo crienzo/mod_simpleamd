@@ -1,7 +1,0 @@
-<configuration name="simpleamd.conf" description="VAD and AMD configuration">
-
-	<settings>
-		<param name="foo" value="300"/>
-	</settings>
-
-</configuration>

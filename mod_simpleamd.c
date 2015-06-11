@@ -1,6 +1,6 @@
 /*
  * mod_simpleamd for FreeSWITCH Modular Media Switching Software Library / Soft-Switch Application
- * Copyright (C) 2014, Christopher M. Rienzo <chris@rienzo.com>
+ * Copyright (C) 2014-2015, Christopher M. Rienzo <chris@rienzo.com>
  *
  * Version: MPL 1.1
  *
@@ -32,25 +32,22 @@
  */
 #include <switch.h>
 
-#include "simpleamd/simpleamd.h"
+#include <simpleamd.h>
 
 /* Defines module interface to FreeSWITCH */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_simpleamd_shutdown);
 SWITCH_MODULE_LOAD_FUNCTION(mod_simpleamd_load);
 SWITCH_MODULE_DEFINITION(mod_simpleamd, mod_simpleamd_load, mod_simpleamd_shutdown, NULL);
 
-#define SIMPLEVAD_START_SYNTAX ""
+#define SIMPLEVAD_START_SYNTAX "{threshold_adjust_ms=200,max_threshold=1300,threshold=130,voice_ms=60,voice_end_ms=850}"
 #define SIMPLEVAD_STOP_SYNTAX ""
 
-#define SIMPLEAMD_START_SYNTAX ""
+#define SIMPLEAMD_START_SYNTAX "{wait_for_voice_ms=2000,machine_ms=1300,threshold_adjust_ms=200,max_threshold=1300,threshold=130,voice_ms=60,voice_end_ms=850}"
 #define SIMPLEAMD_STOP_SYNTAX ""
 
-/**
- * module data
- */
-static struct {
-	switch_memory_pool_t *pool;
-} globals;
+#define SIMPLEBEEP_START_SYNTAX ""
+#define SIMPLEBEEP_STOP_SYNTAX ""
+
 
 /**
  * Forward logs
@@ -65,7 +62,7 @@ static void log_handler(samd_log_level_t level, void *user_data, const char *fil
 	switch_log_level_t slevel = SWITCH_LOG_DEBUG;
 	switch(level) {
 		case SAMD_LOG_DEBUG:
-			slevel = SWITCH_LOG_DEBUG;
+			slevel = SWITCH_LOG_DEBUG10;
 			break;
 		case SAMD_LOG_INFO:
 			slevel = SWITCH_LOG_INFO;
@@ -83,25 +80,21 @@ static void log_handler(samd_log_level_t level, void *user_data, const char *fil
 /**
  * Forward VAD events
  *
- * @param vad_event
- * @param samples
+ * @param vad_event the event fired
+ * @param time_ms time since beginning of detection
  * @param user_data
  */
-static void vad_event_handler(samd_vad_event_t vad_event, uint32_t samples, void *user_data)
+static void vad_event_handler(samd_vad_event_t vad_event, uint32_t time_ms, uint32_t total_voice_ms, uint32_t transition_ms, void *user_data)
 {
 	if (vad_event == SAMD_VAD_VOICE_BEGIN || vad_event == SAMD_VAD_SILENCE_BEGIN) {
 		switch_event_t *event = NULL;
 		switch_core_session_t *session = (switch_core_session_t *)user_data;
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Processing VAD event\n");
+		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Processing VAD event, %s\n", samd_vad_event_to_string(vad_event));
 		if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "simpleamd::vad") == SWITCH_STATUS_SUCCESS) {
-			if (vad_event == SAMD_VAD_VOICE_BEGIN) {
-				switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Value", "speaking");
-			} else {
-				switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Value", "silent");
-			}
+			switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Value", "%s", samd_vad_event_to_string(vad_event));
+			switch_event_add_header(event, SWITCH_STACK_BOTTOM, "time-ms", "%d", time_ms);
 			switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", switch_core_session_get_uuid(session));
 			switch_channel_event_set_data(switch_core_session_get_channel(session), event);
-			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Firing VAD event\n");
 			switch_event_fire(&event);
 		}
 	}
@@ -120,13 +113,18 @@ static switch_bool_t vad_process_buffer(switch_media_bug_t *bug, void *user_data
 	samd_vad_t *vad = (samd_vad_t *)user_data;
 
 	switch(type) {
-	case SWITCH_ABC_TYPE_INIT:
+	case SWITCH_ABC_TYPE_INIT: {
+		switch_core_session_t *session = switch_core_media_bug_get_session(bug);
+		switch_codec_implementation_t read_impl = { 0 };
+		switch_core_session_get_read_impl(session, &read_impl);
+		samd_vad_set_sample_rate(vad, read_impl.actual_samples_per_second);
 		break;
+	}
 	case SWITCH_ABC_TYPE_READ_REPLACE:
 	{
 		switch_frame_t *frame;
 		if ((frame = switch_core_media_bug_get_read_replace_frame(bug))) {
-			samd_vad_process_buffer(vad, frame->data, frame->samples);
+			samd_vad_process_buffer(vad, frame->data, frame->samples, frame->channels);
 			switch_core_media_bug_set_read_replace_frame(bug, frame);
 		}
 		break;
@@ -139,6 +137,80 @@ static switch_bool_t vad_process_buffer(switch_media_bug_t *bug, void *user_data
 	}
 
 	return SWITCH_TRUE;
+}
+
+static void configure_vad(samd_vad_t *vad, switch_core_session_t *session, switch_event_t *params)
+{
+	const char *val;
+	if ((val = switch_event_get_header(params, "threshold_adjust_ms"))) {
+		int v;
+		if (switch_is_number(val) && (v = atoi(val)) >= 0) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "threshold_adjust_ms = %d\n", v);
+			samd_vad_set_initial_adjust_ms(vad, v);
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Ignoring invalid threshold_adjust_ms = \"%s\"\n", val);
+		}
+	}
+	if ((val = switch_event_get_header(params, "max_threshold"))) {
+		double v;
+		if (switch_is_number(val) && (v = atof(val)) > 0.0 && v < 32767.0) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "max_threshold = %f\n", v);
+			samd_vad_set_max_energy_threshold(vad, v);
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Ignoring invalid max_threshold = \"%s\"\n", val);
+		}
+	}
+	if ((val = switch_event_get_header(params, "threshold"))) {
+		double v;
+		if (switch_is_number(val) && (v = atof(val)) > 0.0 && v < 32767.0) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "threshold = %f\n", v);
+			samd_vad_set_energy_threshold(vad, v);
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Ignoring invalid threshold = \"%s\"\n", val);
+		}
+	}
+	if ((val = switch_event_get_header(params, "voice_ms"))) {
+		int v;
+		if (switch_is_number(val) && (v = atoi(val)) > 0) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "voice_ms = %d\n", v);
+			samd_vad_set_voice_ms(vad, v);
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Ignoring invalid voice_ms = \"%s\"\n", val);
+		}
+	}
+	if ((val = switch_event_get_header(params, "voice_end_ms"))) {
+		int v;
+		if (switch_is_number(val) && (v = atoi(val)) > 0) {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "voice_end_ms = %d\n", v);
+			samd_vad_set_voice_end_ms(vad, v);
+		} else {
+			switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Ignoring invalid voice_end_ms = \"%s\"\n", val);
+		}
+	}
+}
+
+static samd_vad_t *create_vad(switch_core_session_t *session, const char *args)
+{
+	samd_vad_t *vad = NULL;
+
+	/* Create detector */
+	samd_vad_init(&vad);
+	samd_vad_set_log_handler(vad, log_handler, session);
+	samd_vad_set_event_handler(vad, vad_event_handler, session);
+
+	/* configure detector */
+	if (!zstr(args)) {
+		switch_event_t *params = NULL;
+		char *largs = switch_core_session_strdup(session, args);
+		if (switch_event_create_brackets(largs, '{', '}', ',', &params, &largs, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS) {
+			configure_vad(vad, session, params);
+		}
+		if (params) {
+			switch_event_destroy(&params);
+		}
+	}
+
+	return vad;
 }
 
 /**
@@ -157,10 +229,7 @@ SWITCH_STANDARD_APP(simplevad_start_app)
 		return;
 	}
 
-	/* Create detector */
-	samd_vad_init(&vad, vad_event_handler, session);
-	samd_vad_set_log_handler(vad, log_handler);
-	/* TODO detector params */
+	vad = create_vad(session, data);
 
 	/* Add media bug */
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "Starting VAD\n");
@@ -202,28 +271,11 @@ static void amd_event_handler(samd_event_t amd_event, uint32_t samples, void *us
 {
 	switch_event_t *event = NULL;
 	switch_core_session_t *session = (switch_core_session_t *)user_data;
-	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Processing AMD event\n");
+	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Processing AMD event, %s\n", samd_event_to_string(amd_event));
 	if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, "simpleamd::amd") == SWITCH_STATUS_SUCCESS) {
-		switch (amd_event) {
-			case SAMD_DEAD_AIR:
-				switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Value", "dead-air");
-				break;
-			case SAMD_MACHINE_VOICE:
-				switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Value", "machine-speaking");
-				break;
-			case SAMD_MACHINE_SILENCE:
-				switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Value", "machine-silent");
-				break;
-			case SAMD_HUMAN_VOICE:
-				switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Value", "human-speaking");
-				break;
-			case SAMD_HUMAN_SILENCE:
-				switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Value", "human-silent");
-				break;
-		}
+		switch_event_add_header(event, SWITCH_STACK_BOTTOM, "Value", "%s", samd_event_to_string(amd_event));
 		switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Unique-ID", switch_core_session_get_uuid(session));
 		switch_channel_event_set_data(switch_core_session_get_channel(session), event);
-		switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "Firing AMD event\n");
 		switch_event_fire(&event);
 	}
 }
@@ -241,13 +293,17 @@ static switch_bool_t amd_process_buffer(switch_media_bug_t *bug, void *user_data
 	samd_t *amd = (samd_t *)user_data;
 
 	switch(type) {
-	case SWITCH_ABC_TYPE_INIT:
+	case SWITCH_ABC_TYPE_INIT: {
+		switch_core_session_t *session = switch_core_media_bug_get_session(bug);
+		switch_codec_implementation_t read_impl = { 0 };
+		switch_core_session_get_read_impl(session, &read_impl);
+		samd_set_sample_rate(amd, read_impl.actual_samples_per_second);
 		break;
-	case SWITCH_ABC_TYPE_READ_REPLACE:
-	{
+	}
+	case SWITCH_ABC_TYPE_READ_REPLACE: {
 		switch_frame_t *frame;
 		if ((frame = switch_core_media_bug_get_read_replace_frame(bug))) {
-			samd_process_buffer(amd, frame->data, frame->samples);
+			samd_process_buffer(amd, frame->data, frame->samples, frame->channels);
 			switch_core_media_bug_set_read_replace_frame(bug, frame);
 		}
 		break;
@@ -260,6 +316,51 @@ static switch_bool_t amd_process_buffer(switch_media_bug_t *bug, void *user_data
 	}
 
 	return SWITCH_TRUE;
+}
+
+static samd_t *create_amd(switch_core_session_t *session, const char *args)
+{
+	samd_t *amd = NULL;
+
+	/* create detector */
+	samd_init(&amd);
+	samd_set_log_handler(amd, log_handler, session);
+	samd_set_event_handler(amd, amd_event_handler, session);
+
+	/* configure detector */
+	if (!zstr(args)) {
+		char *largs = switch_core_session_strdup(session, args);
+		switch_event_t *params = NULL;
+
+		if (switch_event_create_brackets(largs, '{', '}', ',', &params, &largs, SWITCH_FALSE) == SWITCH_STATUS_SUCCESS) {
+			const char *val;
+			configure_vad(samd_get_vad(amd), session, params);
+			if ((val = switch_event_get_header(params, "wait_for_voice_ms"))) {
+				int v;
+				if (switch_is_number(val) && (v = atoi(val)) > 0) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "wait_for_voice_ms = %d\n", v);
+					samd_set_wait_for_voice_ms(amd, v);
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Ignoring invalid wait_for_voice_ms = \"%s\"\n", val);
+				}
+			}
+			if ((val = switch_event_get_header(params, "machine_ms"))) {
+				int v;
+				if (switch_is_number(val) && (v = atoi(val)) > 0) {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "machine_ms = %d\n", v);
+					samd_set_machine_ms(amd, v);
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, "Ignoring invalid machine_ms = \"%s\"\n", val);
+				}
+			}
+		}
+
+		if (params) {
+			switch_event_destroy(&params);
+		}
+	}
+
+	return amd;
 }
 
 /**
@@ -278,14 +379,11 @@ SWITCH_STANDARD_APP(simpleamd_start_app)
 		return;
 	}
 
-	/* Create detector */
-	samd_init(&amd, amd_event_handler, session);
-	samd_set_log_handler(amd, log_handler);
-	/* TODO detector params */
+	amd = create_amd(session, data);
 
 	/* Add media bug */
 	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "Starting AMD\n");
-	switch_core_media_bug_add(session, "_mod_simpleamd_amd", NULL, amd_process_buffer, amd, 0, SMBF_READ_REPLACE | SMBF_NO_PAUSE, &bug);
+	switch_core_media_bug_add(session, "_mod_simpleamd_amd", NULL, amd_process_buffer, amd, 0, SMBF_NO_PAUSE | SMBF_READ_REPLACE, &bug);
 	if (!bug) {
 		samd_destroy(&amd);
 		switch_channel_set_variable(channel, SWITCH_CURRENT_APPLICATION_RESPONSE_VARIABLE, "-ERR can't create media bug");
@@ -313,42 +411,6 @@ SWITCH_STANDARD_APP(simpleamd_stop_app)
 }
 
 /**
- * Configure the module
- * @return SWITCH_STATUS_SUCCESS if successful
- */
-static switch_status_t do_config(switch_memory_pool_t *pool)
-{
-	switch_status_t status = SWITCH_STATUS_SUCCESS;
-#if 0
-	char *cf = "simpleamd.conf";
-	switch_xml_t cfg, xml, settings;
-
-	if (!(xml = switch_xml_open_cfg(cf, &cfg, NULL))) {
-		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "open of %s failed\n", cf);
-		return SWITCH_STATUS_TERM;
-	}
-
-	/* get params */
-	settings = switch_xml_child(cfg, "settings");
-	if (settings) {
-		switch_xml_t param;
-		for (param = switch_xml_child(settings, "param"); param; param = param->next) {
-			char *var = (char *) switch_xml_attr_soft(param, "name");
-			//char *val = (char *) switch_xml_attr_soft(param, "value");
-			if (!strcasecmp(var, "foo")) {
-				/* TODO */
-			} else {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Unsupported param: %s\n", var);
-			}
-		}
-	}
-
-	switch_xml_free(xml);
-#endif
-	return status;
-}
-
-/**
  * Called when FreeSWITCH loads the module
  */
 SWITCH_MODULE_LOAD_FUNCTION(mod_simpleamd_load)
@@ -357,17 +419,16 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_simpleamd_load)
 
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
-	globals.pool = pool;
-
 	SWITCH_ADD_APP(app, "simplevad_start", "Start VAD", "Start VAD", simplevad_start_app, SIMPLEVAD_START_SYNTAX, SAF_MEDIA_TAP);
 	SWITCH_ADD_APP(app, "simplevad_stop", "Stop VAD", "Stop VAD", simplevad_stop_app, SIMPLEVAD_STOP_SYNTAX, SAF_NONE);
 
-	SWITCH_ADD_APP(app, "simpleamd_start", "Start AMD", "Start AMD", simpleamd_start_app, SIMPLEAMD_START_SYNTAX, SAF_MEDIA_TAP);
-	SWITCH_ADD_APP(app, "simpleamd_stop", "Stop AMD", "Stop AMD", simpleamd_stop_app, SIMPLEAMD_STOP_SYNTAX, SAF_NONE);
+	SWITCH_ADD_APP(app, "simpleamd_start", "Start AMD", "Start AMD w/ beep detection", simpleamd_start_app, SIMPLEAMD_START_SYNTAX, SAF_MEDIA_TAP);
+	SWITCH_ADD_APP(app, "simpleamd_stop", "Stop AMD", "Stop AMD w/ beep detection", simpleamd_stop_app, SIMPLEAMD_STOP_SYNTAX, SAF_NONE);
 
-	if (do_config(pool) != SWITCH_STATUS_SUCCESS) {
-		return SWITCH_STATUS_TERM;
-	}
+	#if 0
+	SWITCH_ADD_APP(app, "simplebeep_start", "Start beep detector only", "Start beep detector", simplebeep_start_app, SIMPLEBEEP_START_SYNTAX, SAF_MEDIA_TAP);
+	SWITCH_ADD_APP(app, "simplebeep_stop", "Stop beep detector", "Stop beep detector", simplebeep_stop_app, SIMPLEBEEP_STOP_SYNTAX, SAF_NONE);
+	#endif
 
 	/* indicate that the module should continue to be loaded */
 	return SWITCH_STATUS_SUCCESS;
