@@ -10,3 +10,11 @@ make
 sudo make install
 ```
 
+To create RPM package
+```
+rpm/create_src_tarball.sh
+rpm/build_rpm.sh
+```
+
+RPM package will be in ~rpmbuild/RPMS/...
+

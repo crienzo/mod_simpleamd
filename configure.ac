@@ -1,4 +1,4 @@
-AC_INIT([mod_simpleamd], [1.4.19], http://github.com/crienzo/mod_simpleamd/issues)
+AC_INIT([mod_simpleamd], [1.0.0], http://github.com/crienzo/mod_simpleamd/issues)
 
 AM_INIT_AUTOMAKE
 
